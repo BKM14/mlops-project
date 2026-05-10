@@ -13,6 +13,8 @@ from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import LabelEncoder
 from sklearn.tree import DecisionTreeClassifier
 
+from training.model import build_estimator
+
 FEATURE_COLS = ["outlook", "temperature", "humidity", "wind"]
 LABEL_COL = "play"
 
@@ -68,7 +70,7 @@ def train(df: pd.DataFrame) -> tuple[DecisionTreeClassifier, dict]:
     """
     X = df[FEATURE_COLS]
     y = df[LABEL_COL]
-    model = DecisionTreeClassifier(max_depth=3, random_state=42)
+    model = build_estimator()
     model.fit(X, y)
     accuracy = accuracy_score(y, model.predict(X))
     return model, {"accuracy": round(accuracy, 4), "n_samples": len(df)}

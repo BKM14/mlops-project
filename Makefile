@@ -2,7 +2,7 @@
 PYTHON ?= python3
 PIP    ?= $(PYTHON) -m pip
 
-.PHONY: setup parquet materialize test train serve
+.PHONY: setup parquet materialize test train train-simple serve
 
 setup:
 	$(PIP) install -r requirements.txt
@@ -20,6 +20,10 @@ test:
 
 train:
 	$(PYTHON) training/train.py
+
+# CSV + sklearn + MLflow only (no Feast). Needs MLflow server on MLFLOW_TRACKING_URI.
+train-simple:
+	$(PYTHON) training/train_mlflow_simple.py
 
 serve:
 	$(PYTHON) -m uvicorn serving.app:app --reload

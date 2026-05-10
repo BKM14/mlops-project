@@ -9,6 +9,7 @@ venv/
 htmlcov/
 mlruns/
 mlartifacts/
+models/
 data/registry.db
 data/online_store.db
 feature_store/feature_repo/data/

@@ -18,6 +18,7 @@ sys.path.insert(0, str(_REPO))
 
 from helpers import encode_dataframe, should_deploy, train  # noqa: E402
 from paths import resolved_feast_repo_path  # noqa: E402
+from training.model import default_mlflow_params  # noqa: E402
 MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000")
 THRESHOLD = float(os.environ.get("ACCURACY_THRESHOLD", "0.80"))
 
@@ -55,7 +56,7 @@ def main() -> None:
     run_name = f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     with mlflow.start_run(run_name=run_name):
         model, metrics = train(df)
-        mlflow.log_params({"max_depth": 3, "random_state": 42})
+        mlflow.log_params(default_mlflow_params())
         mlflow.log_metrics(metrics)
         mlflow.sklearn.log_model(
             model,

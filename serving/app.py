@@ -40,7 +40,8 @@ state: dict = {"model": None, "store": None, "encoders": None}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
-    state["model"] = mlflow.sklearn.load_model("models:/tennis_model/Staging")
+    model_uri = os.environ.get("MODEL_URI", "models:/tennis_model/Staging")
+    state["model"] = mlflow.sklearn.load_model(model_uri)
     state["store"] = FeatureStore(repo_path=resolved_feast_repo_path())
     ref_csv = os.environ.get("TENNIS_REFERENCE_CSV", str(DEFAULT_REFERENCE_CSV))
     state["encoders"] = build_feature_encoders_from_csv(ref_csv)

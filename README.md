@@ -1,71 +1,114 @@
 # Tennis Play Prediction — MLOps
 
-End-to-end MLOps for predicting whether weather conditions are suitable to **play tennis**, using the classic 14-row dataset (Outlook, Temperature, Humidity, Wind → Play).
+End-to-end MLOps pipeline that predicts whether weather conditions are
+suitable to **play tennis**, using the classic 14-row Play Tennis dataset
+(`Outlook, Temperature, Humidity, Wind → Play`).
 
-**Stack:** Python 3.11+ (CI uses 3.11; local `python3` is fine), [Feast](https://feast.dev/) (file offline store + Redis online store), [MLflow](https://mlflow.org/) (local tracking + model registry), [FastAPI](https://fastapi.tiangolo.com/) serving, GitHub Actions CI/CD.
+**Stack:**
 
-No Kubernetes. No Kubeflow.
+- **Python 3.10+** (CI uses 3.11)
+- **scikit-learn** — `DecisionTreeClassifier`
+- **[Feast](https://feast.dev/)** — file offline store + Redis online store
+- **[MLflow](https://mlflow.org/)** — local tracking server + model registry
+- **[FastAPI](https://fastapi.tiangolo.com/)** — REST inference endpoints
+- **[Pandera](https://pandera.readthedocs.io/)** — dataset schema validation
+- **GitHub Actions** — unit tests → data validation → smoke test → train & register
+
+> No Kubernetes. No Kubeflow. Everything runs on plain Python + a couple of local
+> infrastructure pieces (Redis, MLflow).
 
 ---
 
-## How everything works
+## Architecture
 
-### High-level flow
-
-```mermaid
-flowchart LR
-  subgraph data [Data]
-    CSV["data/tennis.csv"]
-    PQ["data/tennis_feast.parquet"]
-    CSV --> Build["data/_build_parquet.py"]
-    Build --> PQ
-  end
-  subgraph feast [Feast]
-    Offline["Offline: file parquet"]
-    Online["Online: Redis"]
-    PQ --> Offline
-    Apply["feast apply"] --> Registry["registry.db"]
-    Mat["materialize.py"] --> Online
-    Offline --> Mat
-  end
-  subgraph train [Training]
-    Hist["get_historical_features"]
-    Enc["encode_dataframe"]
-    DT["DecisionTreeClassifier"]
-    ML["MLflow: log + register"]
-    Offline --> Hist --> Enc --> DT --> ML
-  end
-  subgraph serve [Serving]
-    API["FastAPI"]
-    ML --> Load["load models:/tennis_model/Staging"]
-    Load --> API
-    Online --> API
-    CSV --> Enc2["LabelEncoders from CSV"]
-    Enc2 --> API
-  end
+```
+                        ┌──────────────────────────────────────────────────────────┐
+                        │                          Data layer                      │
+                        │                                                          │
+                        │   data/tennis.csv  ─►  data/_build_parquet.py            │
+                        │                       (label-encode + add day_id /       │
+                        │                        event_timestamp)                  │
+                        │                                  │                       │
+                        │                                  ▼                       │
+                        │   data/tennis_feast.parquet  (Int64 features, ns UTC)    │
+                        └─────────────────────────┬────────────────────────────────┘
+                                                  │
+                                                  ▼
+   ┌──────────────────────────────┐    ┌──────────────────────────────────────────┐
+   │ Feature definitions          │    │ Feast offline store (file)               │
+   │ feature_store/feature_repo/  │    │   reads tennis_feast.parquet             │
+   │   ├─ feature_store.yaml      │    │ Feast online store (Redis @ :6379)       │
+   │   ├─ data_sources.py         │◄───│   filled by `feast materialize`          │
+   │   └─ features.py             │    └─────────────────┬────────────────────────┘
+   └──────────────┬───────────────┘                      │
+                  │ feast apply                          │ get_online_features
+                  ▼                                      ▼
+         registry.db ────► training/train.py        serving/app.py (FastAPI)
+                                  │                       ▲
+                                  │ get_historical_        │ load Staging model
+                                  │   features            │
+                                  ▼                       │
+                          MLflow Tracking @ :5000  ───────┘
+                          + Model Registry (tennis_model → Staging)
 ```
 
-1. **Data** — `tennis.csv` is the source of truth for schema and categories. `data/_build_parquet.py` label-encodes categoricals (same integer mapping Feast and training rely on) and writes `tennis_feast.parquet` with `day_id`, `event_timestamp`, and encoded feature columns.
+### What each piece does
 
-2. **Feast** — `feature_store/feature_repo/` defines the entity `day_id` and feature view `tennis_features`. The offline store reads the parquet; `feast apply` registers definitions to `data/registry.db`. **Materialization** copies points-in-time features into **Redis** so you can serve by `day_id`.
+1. **CSV → Parquet** (`data/_build_parquet.py`)
+   `tennis.csv` is the source of truth. The builder label-encodes the four
+   categorical features and the label, adds `day_id` (Int64 entity key) and
+   `event_timestamp` (`datetime64[ns, UTC]`, all rows = `2024-01-01`),
+   and writes `tennis_feast.parquet`. The Feast `FeatureView` declares all
+   features as Int64, so encoding happens **before** parquet — that's why the
+   serving path also keeps a CSV-fitted `LabelEncoder` for raw inputs.
 
-3. **Training** (`training/train.py`) — Loads historical rows from Feast for `day_id` 1–14 at `event_timestamp = 2024-01-01 UTC`, runs `encode_dataframe` (second sklearn `LabelEncoder` pass on stringified values — effectively consistent with stored ints), trains `DecisionTreeClassifier(max_depth=3)`, logs metrics to MLflow, registers **`tennis_model`**, and promotes the new version to **`Staging`** if accuracy ≥ `ACCURACY_THRESHOLD` (default `0.80`).
+2. **Feast** (`feature_store/feature_repo/`)
+   - `feature_store.yaml` — project name, file offline store, Redis online store.
+   - `data_sources.py` — `FileSource` pointing at the parquet (path resolved
+     absolutely, so `feast apply` works from any cwd).
+   - `features.py` — `Entity(name="day", join_keys=["day_id"])` + the
+     `tennis_features` FeatureView with five Int64 fields and a 365-day TTL.
+   - `feast apply` writes `data/registry.db`. `feature_store/materialize.py`
+     pushes points-in-time features into Redis using an explicit
+     `materialize(start=2024-01-01, end=now)` window.
 
-4. **Serving** (`serving/app.py`) — On startup:
-   - Loads the sklearn model from **`models:/tennis_model/Staging`** via MLflow.
-   - Opens a Feast client for online lookups (Redis).
-   - Fits **feature encoders** from `data/tennis.csv` so raw string inputs match the integers the model expects.
+3. **Training** (`training/`)
+   - `helpers.py` — pure functions: `encode_dataframe`, `train`, `should_deploy`,
+     `build_feature_encoders_from_csv`, `encode_raw_features`. No Feast or
+     MLflow imports here so unit tests don't need infra.
+   - `train.py` — entry point: pulls historical features from Feast for
+     `day_id ∈ [1, 14]` at `2024-01-01 UTC`, runs the helpers, logs metrics
+     and parameters to MLflow, registers the sklearn artifact as
+     **`tennis_model`**, and promotes the new version to **`Staging`** when
+     accuracy ≥ `ACCURACY_THRESHOLD` (default `0.80`).
 
-   Two prediction modes:
-   - **`POST /predict`** — Client sends `day_id`; features are read from the Feast **online store** (must be materialized for that id).
-   - **`POST /predict/features`** — Client sends the four weather strings; **no Feast lookup** for features (still requires MLflow for the model artifact).
+4. **Serving** (`serving/app.py`)
+   On startup:
+   - Connects to MLflow (`MLFLOW_TRACKING_URI`) and loads
+     `models:/tennis_model/Staging` (override with `MODEL_URI`).
+   - Opens a `FeatureStore` against the local Feast registry (so
+     `/predict` by `day_id` can read from Redis).
+   - Builds **`LabelEncoder`s** from `data/tennis.csv` so raw string inputs
+     align with the integers the model was trained on.
 
-### Prediction output
+   Two prediction paths:
 
-| Field | Meaning |
-|--------|---------|
-| `prediction` | `0` = No, `1` = Yes (matches encoded label after training pipeline) |
-| `label` | `"No"` or `"Yes"` |
+   | Path | Body | Behavior |
+   |------|------|----------|
+   | `POST /predict` | `{"day_id": int}` | Online lookup in Redis, then `model.predict` |
+   | `POST /predict/features` | raw outlook/temperature/humidity/wind strings | Encoded in-process; **no Redis lookup**. Still requires MLflow at startup. |
+   | `GET /health` | — | Liveness probe |
+
+5. **Tests** (`tests/`)
+   - `tests/unit/` — encoders, train, deploy gate, and round-trip equivalence
+     between the CSV-fit encoders and the parquet ints. No infra needed.
+   - `tests/data_validation/` — Pandera schema check on `tennis.csv`.
+   - `tests/smoke/` — end-to-end fit + predict on the dataset.
+
+6. **CI/CD** (`.github/workflows/ci_cd.yml`)
+   PRs and pushes run the three test jobs in series. The `train-and-register`
+   job runs only on `main`, brings up an ephemeral Redis service, an MLflow
+   server, applies Feast definitions, materializes, and trains.
 
 ---
 
@@ -73,28 +116,27 @@ flowchart LR
 
 ```
 mlops/
-├── .github/workflows/ci_cd.yml   # CI: unit → data validation → smoke → train (main only)
+├── conftest.py                      # repo-root sys.path for pytest
 ├── data/
-│   ├── tennis.csv                # Raw dataset
-│   ├── tennis_feast.parquet      # Generated (do not hand-edit)
-│   └── _build_parquet.py         # CSV → parquet builder
+│   ├── tennis.csv                   # raw dataset (source of truth)
+│   ├── tennis_feast.parquet         # generated, do not hand-edit
+│   └── _build_parquet.py            # CSV → parquet builder
 ├── feature_store/
 │   ├── feature_repo/
-│   │   ├── feature_store.yaml    # Feast project + Redis + file offline store
-│   │   ├── data_sources.py       # Parquet file source (absolute path)
-│   │   └── features.py           # Entity + feature view definitions
-│   └── materialize.py            # Offline → Redis materialization window
+│   │   ├── feature_store.yaml       # local + Redis @ localhost:6379
+│   │   ├── data_sources.py          # absolute parquet path
+│   │   └── features.py              # Entity + FeatureView
+│   └── materialize.py               # offline → Redis, [2024-01-01, now]
 ├── training/
-│   ├── helpers.py                # Encode, train, deploy gate (pure functions)
-│   └── train.py                  # Feast fetch → train → MLflow register
+│   ├── helpers.py                   # pure: encode/train/deploy gate
+│   └── train.py                     # Feast → train → MLflow → Staging
 ├── serving/
-│   └── app.py                    # FastAPI app
+│   └── app.py                       # FastAPI + lifespan model loader
 ├── tests/
-│   ├── unit/
-│   ├── data_validation/
-│   └── smoke/
-├── conftest.py                   # Puts repo root on PYTHONPATH for pytest
-├── Dockerfile
+│   ├── unit/test_helpers.py
+│   ├── data_validation/test_schema.py
+│   └── smoke/test_model_smoke.py
+├── paths.py                         # resilient FEAST_REPO_PATH resolver
 ├── Makefile
 ├── requirements.txt
 └── README.md
@@ -104,56 +146,106 @@ mlops/
 
 ## Prerequisites
 
-| Requirement | Purpose |
-|-------------|---------|
-| **Python 3.10+** (3.11 recommended) | Runtime |
-| **`python3`** on `PATH` | Makefile defaults to `python3` (override: `make train PYTHON=python`) |
+| Requirement | Why |
+|-------------|-----|
+| **Python 3.10+** with `python3` on `PATH` | Makefile defaults to `python3` (override with `make … PYTHON=python`) |
 | **Redis** on `localhost:6379` | Feast online store |
-| **MLflow tracking server** | Training registry + serving loads model from it |
+| **MLflow tracking server** on `localhost:5000` | Used by `train.py` and the FastAPI app |
 
-Optional: Docker for Redis (`docker run … redis`).
+Optional: Docker for Redis (single-line bring-up).
+
+Install Python deps:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
 
 ---
 
-## Commands reference
+## Setup commands (local)
 
-### Makefile targets
+Run all of these from the **repository root** (`/home/balaji/mlops`).
+
+### 1. Bring up Redis
+
+```bash
+docker run -d --name redis-tennis -p 6379:6379 redis
+# or, if Redis is installed natively:
+redis-server &
+```
+
+### 2. Bring up MLflow
+
+```bash
+mlflow server --host 0.0.0.0 --port 5000 &
+```
+
+### 3. Install + bootstrap
+
+```bash
+make setup
+# = pip install -r requirements.txt
+# + python3 data/_build_parquet.py
+# + cd feature_store/feature_repo && feast apply
+```
+
+### 4. Materialize features into Redis
+
+Required so `POST /predict` (online lookup) works.
+
+```bash
+make materialize
+```
+
+### 5. Run tests
+
+No Redis or MLflow required for tests.
+
+```bash
+make test
+```
+
+### 6. Train + register the model
+
+```bash
+make train
+# expected tail:
+# Metrics: {'accuracy': 0.8571, 'n_samples': 14}
+# Model v1 promoted to Staging
+```
+
+### 7. Start the FastAPI server
+
+```bash
+MLFLOW_TRACKING_URI=http://localhost:5000 make serve
+# Uvicorn running on http://127.0.0.1:8000
+```
+
+---
+
+## Makefile reference
 
 | Command | What it does |
-|---------|----------------|
-| `make setup` | `pip install -r requirements.txt`, build parquet, run `feast apply` from `feature_store/feature_repo` |
-| `make parquet` | Only runs `data/_build_parquet.py` |
-| `make materialize` | Runs `feature_store/materialize.py` (writes into Redis for the configured time window) |
-| `make test` | `pytest tests/ -v` (no Redis/MLflow required) |
-| `make train` | Runs `training/train.py` (needs Feast + MLflow + parquet applied) |
-| `make serve` | `uvicorn serving.app:app --reload` |
+|---------|---------------|
+| `make setup` | Install requirements, build parquet, run `feast apply` |
+| `make parquet` | Rebuild `data/tennis_feast.parquet` from `data/tennis.csv` |
+| `make materialize` | Push offline features into Redis (window `[2024-01-01, now]`) |
+| `make test` | `pytest tests/ -v` |
+| `make train` | `python3 training/train.py` |
+| `make serve` | `python3 -m uvicorn serving.app:app --reload` |
 
-Override interpreter: `make serve PYTHON=/usr/bin/python3.11`
+Override the interpreter: `make train PYTHON=/usr/bin/python3.11`.
 
-### One-off commands (equivalent)
+### Equivalent raw commands
 
 ```bash
 python3 -m pip install -r requirements.txt
 python3 data/_build_parquet.py
-cd feature_store/feature_repo && feast apply
-python3 feature_store/materialize.py          # from repo root
+cd feature_store/feature_repo && feast apply && cd -
+python3 feature_store/materialize.py
 python3 -m pytest tests/ -v
 python3 training/train.py
 python3 -m uvicorn serving.app:app --reload --host 0.0.0.0 --port 8000
-```
-
-### Infrastructure (local)
-
-Start Redis:
-
-```bash
-docker run -d --name redis-tennis -p 6379:6379 redis
-```
-
-Start MLflow (adjust host/port if needed):
-
-```bash
-mlflow server --host 0.0.0.0 --port 5000
 ```
 
 ---
@@ -164,132 +256,63 @@ mlflow server --host 0.0.0.0 --port 5000
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FEAST_REPO_PATH` | *(unset → `<repo>/feature_store/feature_repo`)* | If set, can be absolute or relative to the **project root** (not the shell cwd) |
-| `MLFLOW_TRACKING_URI` | `http://localhost:5000` | MLflow tracking URI |
-| `ACCURACY_THRESHOLD` | `0.80` | Minimum accuracy to promote model version to **Staging** |
+| `MLFLOW_TRACKING_URI` | `http://localhost:5000` | MLflow tracking + registry URI |
+| `ACCURACY_THRESHOLD` | `0.80` | Min accuracy required to promote to Staging |
+| `FEAST_REPO_PATH` | *(unset → `<repo>/feature_store/feature_repo`)* | Absolute, or relative to the **project root** |
 
 ### Serving (`serving/app.py`)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MLFLOW_TRACKING_URI` | **Yes** | Same URI used when training/registering |
-| `FEAST_REPO_PATH` | No | Override Feast repo; if unset, resolves to `<repo>/feature_store/feature_repo` (from `paths.py`, **not** the shell cwd) |
+| `MLFLOW_TRACKING_URI` | **Yes** | Same URI used at training time |
+| `MODEL_URI` | No | Defaults to `models:/tennis_model/Staging`; override to pin a version (`models:/tennis_model/3`) |
+| `FEAST_REPO_PATH` | No | If unset, resolves to `<repo>/feature_store/feature_repo` (resilient to a stale shell `export`) |
 | `TENNIS_REFERENCE_CSV` | No | Defaults to `<repo>/data/tennis.csv`; encoders for `/predict/features` |
-
-Example:
-
-```bash
-export MLFLOW_TRACKING_URI="http://localhost:5000"
-make serve
-```
-
-Optional: `export FEAST_REPO_PATH=/absolute/path/to/feature_repo` when not using the default layout.
-
----
-
-## Local development (full stack)
-
-Run from the **repository root** (`mlops/`).
-
-1. **Install, parquet, Feast registration**
-
-   ```bash
-   make setup
-   ```
-
-2. **Redis** (must be listening on `localhost:6379` per `feature_store.yaml`)
-
-3. **MLflow** on port 5000 (or set `MLFLOW_TRACKING_URI` to match)
-
-4. **Materialize** features into Redis (required for `POST /predict` by `day_id`)
-
-   ```bash
-   make materialize
-   ```
-
-5. **Tests** (optional anytime; no Redis/MLflow)
-
-   ```bash
-   make test
-   ```
-
-6. **Train** and register the model (promotes to Staging if accuracy ≥ threshold)
-
-   ```bash
-   export FEAST_REPO_PATH="$PWD/feature_store/feature_repo"
-   export MLFLOW_TRACKING_URI="http://localhost:5000"
-   make train
-   ```
-
-7. **Serve**
-
-   ```bash
-   FEAST_REPO_PATH="$PWD/feature_store/feature_repo" \
-   MLFLOW_TRACKING_URI="http://localhost:5000" \
-   make serve
-   ```
-
-8. **Call the API** — see [API & cURL](#api--curl) below.
 
 ---
 
 ## API & cURL
 
-Base URL in examples: `http://localhost:8000`. For Docker publishing on port 8000, use the same paths.
+Base URL in examples: `http://localhost:8000`. Replace with your deploy URL
+when needed.
 
 ### `GET /health`
 
-Liveness check.
+Liveness probe.
 
 ```bash
 curl -sS http://localhost:8000/health
+# {"status":"ok"}
 ```
 
-Example response:
+### `POST /predict` — predict by `day_id`
 
-```json
-{"status":"ok"}
-```
-
----
-
-### `POST /predict` — predict by `day_id` (Feast online store)
-
-Looks up encoded features for `day_id` in Redis. Only works for days **1–14** after materialization and if Redis matches the Feast repo you trained with.
-
-**Request body:** `{ "day_id": <int> }`
+Reads encoded features from the Feast online store (Redis). Only works for
+`day_id ∈ [1, 14]` after `make materialize`.
 
 ```bash
 curl -sS -X POST http://localhost:8000/predict \
   -H 'Content-Type: application/json' \
   -d '{"day_id": 1}'
-```
+# {"day_id":1,"prediction":0,"label":"No"}
 
-Example response (day 1 is Sunny / Hot / High / Weak → No):
-
-```json
-{"day_id":1,"prediction":0,"label":"No"}
-```
-
-More examples:
-
-```bash
 curl -sS -X POST http://localhost:8000/predict \
   -H 'Content-Type: application/json' \
   -d '{"day_id": 3}'
+# {"day_id":3,"prediction":1,"label":"Yes"}
 
 curl -sS -X POST http://localhost:8000/predict \
   -H 'Content-Type: application/json' \
   -d '{"day_id": 14}'
+# {"day_id":14,"prediction":0,"label":"No"}
 ```
 
----
+### `POST /predict/features` — predict from raw weather strings
 
-### `POST /predict/features` — predict from raw weather fields
+Does **not** query Redis. Encodes inputs in-process using the CSV-fit
+`LabelEncoder`s. Useful when there is no `day_id` (e.g. predicting today).
 
-Does **not** query Redis for features. Encodes strings using the same vocabulary as `data/tennis.csv`. Still loads the model from MLflow on startup.
-
-Allowed values (must match CSV exactly):
+Allowed values (must match `data/tennis.csv` exactly):
 
 | Field | Values |
 |-------|--------|
@@ -307,83 +330,102 @@ curl -sS -X POST http://localhost:8000/predict/features \
     "humidity": "High",
     "wind": "Weak"
   }'
+# {"prediction":0,"label":"No"}
+
+curl -sS -X POST http://localhost:8000/predict/features \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "outlook": "Overcast",
+    "temperature": "Cool",
+    "humidity": "Normal",
+    "wind": "Strong"
+  }'
+# {"prediction":1,"label":"Yes"}
 ```
 
-Example response:
+Invalid categories return **HTTP 422** with a detail message (FastAPI/Pydantic
+rejects them at the body level when they're outside the `Literal` set).
 
-```json
-{"prediction":0,"label":"No"}
-```
+### Response schema
 
-Invalid category → **422** with a detail message.
+| Endpoint | Field | Type | Notes |
+|----------|-------|------|-------|
+| `/predict` & `/predict/features` | `prediction` | `int` | `0` = No, `1` = Yes |
+| | `label` | `str` | `"No"` or `"Yes"` |
+| `/predict` only | `day_id` | `int` | Echoed back |
 
 ---
 
-## Docker
+## CI/CD
 
-Build:
+`.github/workflows/ci_cd.yml` runs four jobs:
 
-```bash
-docker build -t tennis-mlops .
-```
+| Job | Trigger | Purpose |
+|-----|---------|---------|
+| `unit-tests` | every push / PR | `pytest tests/unit/` |
+| `data-validation` | after unit | Pandera schema on `tennis.csv` |
+| `smoke-test` | after data-validation | end-to-end fit + predict |
+| `train-and-register` | after smoke, **`main` only** | spins up Redis, MLflow, runs `feast apply` + materialize + train |
 
-The image sets `PYTHONPATH=/app` and runs Uvicorn on port **8000**. You must still provide **MLflow**, **Redis**, **Feast materialization**, and env vars at runtime (for example via Docker Compose or host networking). Minimum env for the process:
-
-- `MLFLOW_TRACKING_URI`
-- `FEAST_REPO_PATH`
-
-Run container example (assumes MLflow and Redis reachable from the container):
-
-```bash
-docker run --rm -p 8000:8000 \
-  -e MLFLOW_TRACKING_URI=http://host.docker.internal:5000 \
-  -e FEAST_REPO_PATH=/app/feature_store/feature_repo \
-  tennis-mlops
-```
-
-Adjust `host.docker.internal` or use `--network host` on Linux as needed.
+PRs run the three test jobs without infra. `main` runs the full pipeline.
 
 ---
 
-## CI/CD (GitHub Actions)
+## Verification checklist
 
-Workflow: `.github/workflows/ci_cd.yml`
+After `make setup → make materialize → make train → make serve` you should
+hit all of these:
 
-| Job | Runs | Purpose |
-|-----|------|---------|
-| `unit-tests` | Every push / PR | `pytest tests/unit/` |
-| `data-validation` | After unit | `pytest tests/data_validation/` |
-| `smoke-test` | After data-validation | `pytest tests/smoke/` |
-| `train-and-register` | After smoke, **only on `main`** | Redis service, build parquet, MLflow server, `feast apply`, materialize, `training/train.py` |
-
-Pull requests get the first three jobs; merging to `main` runs training + registry when all prerequisites pass.
-
----
-
-## Acceptance checklist
-
-- `make test` passes without Redis or MLflow.
-- After `make setup`, Redis, MLflow, `make materialize`, and `make train`: `tennis_model` appears in MLflow with a version in **Staging**.
-- `make serve` with env vars set returns `{"status":"ok"}` from `/health`.
-- `POST /predict` with `{"day_id": 1}` returns `"label": "No"` when the stack is aligned with materialized data.
-- `POST /predict/features` with Sunny/Hot/High/Weak returns `"label": "No"` without needing Redis for that request.
+- `make test` is green (7 tests).
+- The MLflow UI at `http://localhost:5000` shows experiment `tennis-prediction`
+  with a registered model **`tennis_model`** in **Staging**.
+- `curl http://localhost:8000/health` returns `{"status":"ok"}`.
+- `POST /predict {"day_id":1}` returns `{"label":"No"}`.
+- `POST /predict/features` with Sunny/Hot/High/Weak returns `{"label":"No"}`.
 
 ---
 
 ## Troubleshooting
 
-| Issue | What to check |
-|-------|----------------|
-| `FileNotFoundError: … feature_store.yaml` under `$HOME` or the wrong tree | A stale `FEAST_REPO_PATH` is exported in your shell (often from a previous `export FEAST_REPO_PATH="$PWD/feature_store/feature_repo"` run elsewhere). Run `unset FEAST_REPO_PATH` and retry. `paths.py` also auto-falls back to the in-repo default when the env-var path lacks a `feature_store.yaml` and prints a warning to stderr. |
-| `make: python: No such file` | Use this repo’s Makefile (`python3`) or `make … PYTHON=python3` |
-| `Registered Model … tennis_model not found` | Run `make train` successfully against the same `MLFLOW_TRACKING_URI` before `make serve` |
-| `Feature view tennis_features does not exist` | Run `make setup` or `cd feature_store/feature_repo && feast apply` |
-| Materialization **0 rows** | Ensure `materialize.py` time window covers `event_timestamp` in parquet; re-run `make parquet` + `feast apply` if you changed data |
-| `/predict` fails for a `day_id` | Materialize after `feast apply`; Redis must be up and reachable at `localhost:6379` |
-| Pip conflicts involving `pyarrow` | This repo pins versions compatible with MLflow 2.13.x (`pyarrow<16`); use `requirements.txt` |
+| Symptom | What to do |
+|---------|------------|
+| `make: python: No such file` | This Makefile uses `python3`. If you forked an older one, set `make … PYTHON=python3`. |
+| `RESOURCE_DOES_NOT_EXIST: tennis_model not found` at startup | `make train` didn't succeed against the same `MLFLOW_TRACKING_URI`. Train first, then start the API. |
+| `FeatureViewNotFoundException: Feature view tennis_features does not exist` | Run `cd feature_store/feature_repo && feast apply` (or `make setup`). |
+| `Materializing 0 feature views` | The materialize window doesn't cover `event_timestamp` in the parquet. The included script uses `start=2024-01-01` explicitly — re-run after `feast apply`. |
+| `FileNotFoundError: …/feature_store/feature_repo/feature_store.yaml` under `$HOME` | Stale `FEAST_REPO_PATH` in your shell. `unset FEAST_REPO_PATH` and retry; `paths.py` also auto-falls back if the env-var path is missing `feature_store.yaml`. |
+| `ValueError: invalid literal for int() with base 10: 'Sunny'` during materialize | Parquet wasn't rebuilt after a CSV change. `make parquet` then `make materialize`. |
+| Pip resolver conflict involving `pyarrow` | This repo pins `pyarrow==15.0.2` to satisfy MLflow 2.13.x's `pyarrow<16` constraint. Stay on the pinned versions. |
+| `/predict` returns null/error for some `day_id` | Run `make materialize` after the latest `feast apply`. |
+| `502/connection refused` from `/predict` | Redis isn't reachable on `localhost:6379`. Start it (see Setup §1). |
 
 ---
 
-## License / data
+## Quick recap (copy-paste)
 
-The Play Tennis dataset is a standard toy dataset for teaching; use and redistribution follow your organization’s policies.
+```bash
+# infra
+docker run -d -p 6379:6379 redis
+mlflow server --host 0.0.0.0 --port 5000 &
+
+# bootstrap
+unset FEAST_REPO_PATH
+make setup
+make materialize
+
+# verify
+make test
+
+# train + serve
+make train
+MLFLOW_TRACKING_URI=http://localhost:5000 make serve
+
+# call
+curl -sS http://localhost:8000/health
+curl -sS -X POST http://localhost:8000/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"day_id": 1}'
+curl -sS -X POST http://localhost:8000/predict/features \
+  -H 'Content-Type: application/json' \
+  -d '{"outlook":"Sunny","temperature":"Hot","humidity":"High","wind":"Weak"}'
+```
