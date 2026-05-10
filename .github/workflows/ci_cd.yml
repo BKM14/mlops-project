@@ -1,0 +1,71 @@
+name: Tennis MLOps CI/CD
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - run: pytest tests/unit/ -v
+
+  data-validation:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - run: pytest tests/data_validation/ -v
+
+  smoke-test:
+    needs: data-validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - run: pytest tests/smoke/ -v
+
+  train-and-register:
+    needs: smoke-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - name: Build Feast parquet from CSV
+        run: python data/_build_parquet.py
+      - name: Start MLflow server
+        run: |
+          mlflow server --host 0.0.0.0 --port 5000 &
+          for i in {1..30}; do
+            curl -fs http://localhost:5000/ >/dev/null && break
+            sleep 1
+          done
+      - name: Apply Feast feature definitions
+        run: cd feature_store/feature_repo && feast apply
+      - name: Materialize features
+        run: python feature_store/materialize.py
+        env:
+          FEAST_REPO_PATH: feature_store/feature_repo
+      - name: Train and register model
+        run: python training/train.py
+        env:
+          FEAST_REPO_PATH: feature_store/feature_repo
+          MLFLOW_TRACKING_URI: http://localhost:5000
+          ACCURACY_THRESHOLD: "0.80"
