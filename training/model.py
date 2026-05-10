@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from sklearn.tree import DecisionTreeClassifier
 
-MAX_DEPTH = 7
-RANDOM_STATE = 42
+MAX_DEPTH = 3
+RANDOM_STATE = 21
 
 
 def build_estimator(
